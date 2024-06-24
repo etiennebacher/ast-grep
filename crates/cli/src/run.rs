@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ast_grep_config::Fixer;
-use ast_grep_core::{Matcher, Pattern};
+use ast_grep_core::{MatchStrictness, Matcher, Pattern};
 use ast_grep_language::Language;
-use clap::Parser;
+use clap::{builder::PossibleValue, Parser, ValueEnum};
 use ignore::WalkParallel;
 
 use crate::config::register_custom_language;
+use crate::debug::DebugFormat;
 use crate::error::ErrorContext as EC;
 use crate::lang::SgLang;
 use crate::print::{ColoredPrinter, Diff, Heading, InteractivePrinter, JSONPrinter, Printer};
@@ -35,6 +36,33 @@ fn lang_help() -> String {
 
 const LANG_HELP_LONG: &str = "The language of the pattern. For full language list, visit https://ast-grep.github.io/reference/languages.html";
 
+#[derive(Clone)]
+struct Strictness(MatchStrictness);
+impl ValueEnum for Strictness {
+  fn value_variants<'a>() -> &'a [Self] {
+    use MatchStrictness as M;
+    &[
+      Strictness(M::Cst),
+      Strictness(M::Smart),
+      Strictness(M::Ast),
+      Strictness(M::Relaxed),
+      Strictness(M::Signature),
+    ]
+  }
+  fn to_possible_value(&self) -> Option<PossibleValue> {
+    use MatchStrictness as M;
+    Some(match &self.0 {
+      M::Cst => PossibleValue::new("cst").help("Match exact all node"),
+      M::Smart => PossibleValue::new("smart").help("Match all node except source trivial nodes"),
+      M::Ast => PossibleValue::new("ast").help("Match only ast nodes"),
+      M::Relaxed => PossibleValue::new("relaxed").help("Match ast node except comments"),
+      M::Signature => {
+        PossibleValue::new("signature").help("Match ast node except comments, without text")
+      }
+    })
+  }
+}
+
 #[derive(Parser)]
 pub struct RunArg {
   // search pattern related options
@@ -51,8 +79,19 @@ pub struct RunArg {
   lang: Option<SgLang>,
 
   /// Print query pattern's tree-sitter AST. Requires lang be set explicitly.
-  #[clap(long, requires = "lang")]
-  debug_query: bool,
+  #[clap(
+      long,
+      requires = "lang",
+      value_name="format",
+      num_args(0..=1),
+      require_equals = true,
+      default_missing_value = "pattern"
+  )]
+  debug_query: Option<DebugFormat>,
+
+  /// The strictness of the pattern.
+  #[clap(long)]
+  strictness: Option<Strictness>,
 
   /// input related options
   #[clap(flatten)]
@@ -103,6 +142,17 @@ pub struct RunArg {
   /// It conflicts with both the -B/--before and -A/--after flags.
   #[clap(short = 'C', long, default_value = "0", value_name = "NUM")]
   context: u16,
+}
+
+impl RunArg {
+  fn build_pattern(&self, lang: SgLang) -> Result<Pattern<SgLang>> {
+    let pattern = Pattern::try_new(&self.pattern, lang).context(EC::ParsePattern)?;
+    if let Some(strictness) = &self.strictness {
+      Ok(pattern.with_strictness(strictness.0.clone()))
+    } else {
+      Ok(pattern)
+    }
+  }
 }
 
 // Every run will include Search or Replace
@@ -177,7 +227,7 @@ impl<P: Printer> PathWorker for RunWithInferredLang<P> {
 
   fn produce_item(&self, path: &Path) -> Option<Self::Item> {
     let lang = SgLang::from_path(path)?;
-    let matcher = Pattern::try_new(&self.arg.pattern, lang).ok()?;
+    let matcher = self.arg.build_pattern(lang).ok()?;
     let match_unit = filter_file_pattern(path, lang, matcher)?;
     Some((match_unit, lang))
   }
@@ -191,9 +241,8 @@ struct RunWithSpecificLang<Printer> {
 
 impl<Printer> RunWithSpecificLang<Printer> {
   fn new(arg: RunArg, printer: Printer) -> Result<Self> {
-    let pattern = &arg.pattern;
     let lang = arg.lang.ok_or(anyhow::anyhow!(EC::LanguageNotSpecified))?;
-    let pattern = Pattern::try_new(pattern, lang).context(EC::ParsePattern)?;
+    let pattern = arg.build_pattern(lang)?;
     Ok(Self {
       arg,
       printer,
@@ -210,8 +259,8 @@ impl<P: Printer> Worker for RunWithSpecificLang<P> {
     printer.before_print()?;
     let arg = &self.arg;
     let lang = arg.lang.expect("must present");
-    if arg.debug_query {
-      println!("Pattern TreeSitter {:?}", self.pattern);
+    if let Some(format) = arg.debug_query {
+      format.debug_query(&self.arg.pattern, lang, self.arg.output.color);
     }
     let rewrite = if let Some(s) = &arg.rewrite {
       Some(Fixer::from_str(s, &lang).context(EC::ParsePattern)?)
@@ -290,7 +339,8 @@ mod test {
       rewrite: None,
       lang: None,
       heading: Heading::Never,
-      debug_query: false,
+      debug_query: None,
+      strictness: None,
       input: InputArgs {
         no_ignore: vec![],
         stdin: false,
