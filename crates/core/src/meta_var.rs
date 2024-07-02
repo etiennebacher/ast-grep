@@ -201,7 +201,7 @@ pub enum MetaVariable {
   MultiCapture(MetaVariableID),
 }
 
-pub(crate) fn extract_meta_var(src: &str, meta_char: char) -> Option<MetaVariable> {
+pub fn extract_meta_var(src: &str, meta_char: char) -> Option<MetaVariable> {
   use MetaVariable::*;
   let ellipsis: String = std::iter::repeat(meta_char).take(3).collect();
   if src == ellipsis {
